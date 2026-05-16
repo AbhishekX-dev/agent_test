@@ -1,7 +1,9 @@
 import 'dotenv/config';
+import Anthropic from '@anthropic-ai/sdk';
 import { Command } from 'commander';
 import { scanPage } from './tools/scanner.js';
 import { createGitHubIssue } from './tools/github.js';
+import { getMcpClient } from './tools/mcp.js';
 import {
   printBanner,
   printPhase,
@@ -11,7 +13,12 @@ import {
   printSpinner
 } from './ui.js';
 
-// ─── MiniMax Reasoning Function ─────────────────────────────────────────────
+const anthropic = new Anthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY,
+  baseURL: process.env.ANTHROPIC_BASE_URL
+});
+
+// ─── Reasoning Function ─────────────────────────────────────────────
 
 async function reasonWithMiniMax(violations, url) {
   const prompt = `You are auditing the webpage: ${url}
@@ -38,42 +45,82 @@ Analyze each violation and return a JSON array where each item has exactly this 
 
 Return only the raw JSON array. No markdown. No explanation. No code fences.`;
 
-  const groupId = process.env.MINIMAX_GROUP_ID;
-  const apiKey = process.env.MINIMAX_API_KEY;
-  const baseUrl = 'https://api.minimax.io/v1/text/chatcompletion_v2';
-  const url_with_group = groupId && groupId !== 'paste_your_group_id_here'
-    ? `${baseUrl}?GroupId=${groupId}`
-    : baseUrl;
+  // 1. Initialize MCP Client
+  let formattedTools = [];
+  try {
+    const mcpClient = await getMcpClient();
+    const { tools } = await mcpClient.listTools();
+    formattedTools = tools.map(t => ({
+      name: t.name,
+      description: t.description,
+      input_schema: t.inputSchema
+    }));
+  } catch(e) {
+    printLog('Warning', `Failed to load MCP tools: ${e.message}`, 'yellow');
+  }
 
-  const response = await fetch(url_with_group, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      model: 'MiniMax-M2',
-      max_tokens: 4000,
-      temperature: 0.2,
-      messages: [
-        {
-          role: 'system',
-          content: 'You are an expert accessibility QA engineer. Always respond with valid JSON only. No markdown, no explanation outside the JSON array. No code fences.'
-        },
-        {
-          role: 'user',
-          content: prompt
+  let messages = [
+    {
+      role: 'user',
+      content: prompt + "\nFeel free to use the get_rules or other tools to lookup specific rule context before generating the final JSON array. ONLY return JSON at the end, nothing else."
+    }
+  ];
+
+  let msg;
+  try {
+    // 2. Autonomous Tool Calling Loop for Reason Phase
+    while (true) {
+      msg = await anthropic.messages.create({
+        model: process.env.ANTHROPIC_MODEL,
+        max_tokens: 4000,
+        temperature: 0.2,
+        system: 'You are an expert accessibility QA engineer. You may use tools to gather information. Once you have all info, always respond with valid JSON only. No markdown, no explanation outside the JSON array. No code fences.',
+        tools: formattedTools.length > 0 ? formattedTools : undefined,
+        messages: messages
+      });
+
+      if (msg.stop_reason === 'tool_use') {
+        messages.push({ role: "assistant", content: msg.content });
+        for (const content of msg.content) {
+          if (content.type === "tool_use") {
+            const mcpClient = await getMcpClient();
+            try {
+              const result = await mcpClient.callTool({
+                name: content.name,
+                arguments: content.input
+              });
+              messages.push({
+                role: "user",
+                content: [
+                  {
+                    type: "tool_result",
+                    tool_use_id: content.id,
+                    content: JSON.stringify(result.content)
+                  }
+                ]
+              });
+            } catch (e) {
+              messages.push({
+                role: "user",
+                content: [
+                  {
+                    type: "tool_result",
+                    tool_use_id: content.id,
+                    content: `Error: ${e.message}`,
+                    is_error: true
+                  }
+                ]
+              });
+            }
+          }
         }
-      ]
-    })
-  });
-
-    if (!response.ok || (await response.clone().json()).base_resp?.status_code !== 0) {
-      const data = await response.json();
-      const errMsg = data.base_resp?.status_msg || data.error?.message || `HTTP ${response.status}`;
-      
+      } else {
+        break; // Got the final JSON response
+      }
+    }
+  } catch (err) {
       // Fallback Mode: If API key fails, provide realistic mock data so the hackathon demo still works
-      printLog('Warning', `MiniMax API error: ${errMsg}`, 'yellow');
+      printLog('Warning', `API error: ${err.message}`, 'yellow');
       printLog('Info', 'Falling back to local Mock Reasoning Mode for Demo...', 'blue');
       
       return violations.map(v => {
@@ -95,10 +142,14 @@ Return only the raw JSON array. No markdown. No explanation. No code fences.`;
           escalate: confidence >= 80
         };
       });
-    }
+  }
 
-  const data = await response.json();
-  let content = data.choices[0].message.content;
+  let content = msg.content[0]?.text || msg.content;
+  if (Array.isArray(msg.content)) {
+    content = msg.content.map(c => c.text).join('\n');
+  } else if (typeof msg.content === 'string') {
+    content = msg.content;
+  }
 
   // Strip markdown code fences if model ignores instructions
   content = content.replace(/```json/gi, '').replace(/```/g, '').trim();
@@ -106,8 +157,8 @@ Return only the raw JSON array. No markdown. No explanation. No code fences.`;
   try {
     return JSON.parse(content);
   } catch (e) {
-    console.error('Raw MiniMax response:', content);
-    throw new Error('Failed to parse MiniMax response as JSON');
+    console.error('Raw response:', content);
+    throw new Error('Failed to parse response as JSON');
   }
 }
 
@@ -189,12 +240,12 @@ async function audit(url) {
     }
 
     // ── PHASE 2: REASON ───────────────────────────────────────────
-    printPhase('REASON', `Sending ${violations.length} violations to MiniMax M2`);
+    printPhase('REASON', `Sending ${violations.length} violations to OpenRouter (Minimax M2)`);
     printLog('Reason', 'Analyzing who is affected by each violation...', 'magenta');
     printLog('Reason', 'Calculating business impact and severity...', 'magenta');
     printLog('Reason', 'Generating confidence scores and remediation hints...', 'magenta');
 
-    const spinner2 = printSpinner('MiniMax M2 is reasoning...');
+    const spinner2 = printSpinner('Model is reasoning...');
     spinner2.start();
 
     let reasonedIssues;
@@ -289,36 +340,83 @@ async function explain(violationId) {
     printBanner();
     printPhase('REASON', `Explaining WCAG violation: ${violationId}`);
 
-    const spinner = printSpinner(`Asking MiniMax M2 to explain '${violationId}'...`);
+    const spinner = printSpinner(`Initializing MCP A11y Tools & Reasoning about '${violationId}'...`);
     spinner.start();
 
-    const response = await fetch('https://api.minimax.io/v1/text/chatcompletion_v2', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${process.env.MINIMAX_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: 'MiniMax-M2',
-        max_tokens: 300,
+    // 1. Initialize MCP Client
+    const mcpClient = await getMcpClient();
+    const { tools } = await mcpClient.listTools();
+    const formattedTools = tools.map(t => ({
+      name: t.name,
+      description: t.description,
+      input_schema: t.inputSchema
+    }));
+
+    let messages = [
+      {
+        role: 'user',
+        content: `Explain WCAG violation '${violationId}' in plain English. Use the provided tools (like get_rules) to find out exactly what this rule means first! Who does it affect, why does it matter, and give a concrete real-world example of the problem. Keep it under 150 words. Write for a developer who is not an accessibility expert.`
+      }
+    ];
+
+    let explanation = "";
+
+    // 2. Autonomous Tool Calling Loop
+    while (true) {
+      const msg = await anthropic.messages.create({
+        model: process.env.ANTHROPIC_MODEL,
+        max_tokens: 500,
         temperature: 0.3,
-        messages: [
-          {
-            role: 'user',
-            content: `Explain WCAG violation '${violationId}' in plain English. Who does it affect, why does it matter, and give a concrete real-world example of the problem. Keep it under 150 words. Write for a developer who is not an accessibility expert.`
+        tools: formattedTools,
+        messages: messages
+      });
+
+      if (msg.stop_reason === 'tool_use') {
+        messages.push({ role: "assistant", content: msg.content });
+        for (const content of msg.content) {
+          if (content.type === "tool_use") {
+            spinner.text = `Agent is calling MCP tool: ${content.name}...`;
+            try {
+              const result = await mcpClient.callTool({
+                name: content.name,
+                arguments: content.input
+              });
+              messages.push({
+                role: "user",
+                content: [
+                  {
+                    type: "tool_result",
+                    tool_use_id: content.id,
+                    content: JSON.stringify(result.content)
+                  }
+                ]
+              });
+            } catch (e) {
+              messages.push({
+                role: "user",
+                content: [
+                  {
+                    type: "tool_result",
+                    tool_use_id: content.id,
+                    content: `Error: ${e.message}`,
+                    is_error: true
+                  }
+                ]
+              });
+            }
           }
-        ]
-      })
-    });
-
-    if (!response.ok) {
-      const errText = await response.text();
-      spinner.fail(`API error: ${response.status}`);
-      throw new Error(errText);
+        }
+      } else {
+        if (Array.isArray(msg.content)) {
+          explanation = msg.content.map(c => c.text || '').join('\n');
+        } else if (typeof msg.content === 'string') {
+          explanation = msg.content;
+        } else {
+          explanation = msg.content[0]?.text || '';
+        }
+        break;
+      }
     }
-
-    const data = await response.json();
-    const explanation = data.choices[0].message.content;
 
     spinner.stop('Explanation ready');
     console.log('');
